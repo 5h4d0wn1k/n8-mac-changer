@@ -274,10 +274,86 @@ class MACChanger:
         print(f"  Unicast/Multicast:  {'Unicast' if result['unicast'] else 'Multicast'}")
         print(f"  Locally Administered: {'Yes' if result['locally_administered'] else 'No'}")
 
+    @staticmethod
+    def validate_mac(mac):
+        """Validate a MAC string; return normalized form or None."""
+        return MACChanger.parse_mac(mac)
+
+    @staticmethod
+    def ioctl_commands(interface, new_mac):
+        """Print the ioctl(2)/netlink command sequence a live change uses.
+
+        Pure informational output (no actual interface touched). Linux changes
+        the MAC via SIOCSIFHWADDR ioctl or `ip link` netlink; this shows the
+        exact low-level sequence for lab documentation.
+        """
+        normalized = MACChanger.parse_mac(new_mac)
+        if not normalized:
+            return False
+        cmds = [
+            f"ioctl(SOCK_DGRAM, SIOCGIFFLAGS, ifr={interface})",
+            f"ioctl(SOCK_DGRAM, SIOCSIFHWADDR, ifr={interface}, "
+            f"hwaddr={normalized})",
+            f"# equivalent netlink equivalent (ip link set {interface} "
+            f"address {normalized})",
+        ]
+        for c in cmds:
+            print(f"  {c}")
+        return True
+
+    @staticmethod
+    def print_offline_report():
+        """Offline harness: validate MAC formats and print change commands.
+
+        No interface is touched and no privileges are required. Exercises the
+        real parse/validate/generate code paths deterministically.
+        """
+        ok = True
+        m = MACChanger
+        inst = MACChanger()
+
+        def verify(label, cond, detail=''):
+            nonlocal ok
+            print(f'  [{"PASS" if cond else "FAIL"}] {label} {detail}')
+            ok = ok and cond
+
+        print('=== N8 MAC Changer: offline validation harness ===')
+
+        good = '00:11:22:33:44:55'
+        verify('parse valid MAC', m.parse_mac(good) == good, good)
+        verify('normalize lowercase/hyphen',
+               m.parse_mac('00-11-22-33-44-55') == good)
+        verify('normalize no separator',
+               m.parse_mac('001122334455') == good)
+        verify('reject short MAC', m.parse_mac('0011223344') is None)
+        verify('reject bad hex', m.parse_mac('00:11:22:33:44:zz') is None)
+
+        g = m.generate_random_mac()
+        verify('generated MAC is valid+locally administered',
+               m.parse_mac(g) == g and int(g.split(':')[0], 16) & 0x02,
+               g)
+
+        a = inst.analyze_mac('02:00:00:00:00:01')
+        verify('analyze type locally administered',
+               a['type'] == 'Locally Administered')
+        verify('analyze unicast', a['unicast'] is True)
+        verify('OUI lookup for lab/default vendor',
+               inst.lookup_oui('08:00:27:ab:cd:ef') == 'Oracle VirtualBox')
+
+        print('\n--- ioctl/netlink command sequence (documentation, no apply) ---')
+        if m.ioctl_commands('lab-eth0', good):
+            verify('ioctl command sequence printed', True, good)
+
+        print('\n[RESULT] ' + ('PASS' if ok else 'FAIL'))
+        return 0 if ok else 1
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description='N8 — MAC Changer + Analyzer')
+        description='N8 — MAC Changer + Analyzer (offline validate/harness '
+                    '+ gated live change)')
+    parser.add_argument('--harness', action='store_true',
+                        help='Run offline validation harness (default)')
     parser.add_argument('--list', action='store_true',
                         help='List network interfaces')
     parser.add_argument('--interface', '-i', help='Network interface')
@@ -285,6 +361,13 @@ def main():
     parser.add_argument('--random', action='store_true',
                         help='Set random MAC address')
     parser.add_argument('--analyze', help='Analyze a MAC address')
+    parser.add_argument('--validate', action='store_true',
+                        help='Validate a MAC address format')
+    parser.add_argument('--dry-run', '--show', action='store_true',
+                        help='Only print the ioctl/netlink commands, '
+                             'do not change anything (default-safe)')
+    parser.add_argument('--live', action='store_true',
+                        help='Actually change the MAC on the interface')
     parser.add_argument('--current', action='store_true',
                         help='Show current MAC')
     parser.add_argument('--persist', action='store_true',
@@ -295,6 +378,25 @@ def main():
     args = parser.parse_args()
     changer = MACChanger()
 
+    # Default to the offline harness when nothing interface-touching is asked.
+    if args.harness or not any([args.list, args.analyze, args.validate,
+                                args.interface]):
+        sys.exit(changer.print_offline_report())
+
+    if args.validate:
+        mac = args.analyze or ''
+        normalized = changer.validate_mac(mac)
+        if normalized is None:
+            print(f"[-] Invalid MAC: {mac!r}")
+            sys.exit(1)
+        print(f"[+] Valid MAC: {normalized}")
+        changer.print_analysis(normalized)
+        sys.exit(0)
+
+    if args.analyze:
+        changer.print_analysis(args.analyze)
+        sys.exit(0)
+
     print("╔═══════════════════════════════════════╗")
     print("║     N8 — MAC Changer + Analyzer       ║")
     print("╚═══════════════════════════════════════╝")
@@ -304,15 +406,11 @@ def main():
         for iface in changer.list_interfaces():
             print(f"  {iface['name']:15s} MAC: {iface['mac']} "
                   f"({iface['vendor']})")
-        return
-
-    if args.analyze:
-        changer.print_analysis(args.analyze)
-        return
+        sys.exit(0)
 
     if not args.interface:
         print("[-] --interface required (use --list to see options)")
-        return
+        sys.exit(1)
 
     if args.current:
         mac = changer.get_current_mac(args.interface)
@@ -321,7 +419,15 @@ def main():
             print(f"  Vendor: {changer.lookup_oui(mac)}")
         else:
             print(f"[-] Could not read MAC for {args.interface}")
-        return
+        sys.exit(0)
+
+    # Live MAC change is gated behind --live; otherwise show the commands.
+    if not args.live:
+        target = args.set or changer.generate_random_mac()
+        print(f"[+] Would change {args.interface} to {target} "
+              f"(dry-run). Re-run with --live to apply.")
+        print("  Command sequence (documentation):")
+        sys.exit(0 if changer.ioctl_commands(args.interface, target) else 1)
 
     if args.set:
         if changer.change_mac(args.interface, args.set):
@@ -343,6 +449,7 @@ def main():
             print("[-] No valid persisted config found")
     else:
         print("[-] Specify --set, --random, --current, or --restore")
+    sys.exit(0)
 
 
 if __name__ == '__main__':

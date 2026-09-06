@@ -27,45 +27,64 @@ No external dependencies — uses only the Python standard library.
 ## Usage
 
 ```bash
+# Offline validation harness (default): validate MAC formats, generate random,
+# print ioctl/netlink command sequence - no privileges, no interface touched
+python3 mac_changer.py --harness
+
+# Validate a MAC format (offline)
+python3 mac_changer.py --validate 00:11:22:33:44:55
+
+# Analyze any MAC address (offline)
+python3 mac_changer.py --analyze 00:11:22:33:44:55
+
 # List interfaces and current MACs
 python3 mac_changer.py --list
 
 # Show current MAC
-python3 mac_changer.py --interface eth0 --current
+python3 mac_changer.py --interface lab-eth0 --current
 
-# Change to random MAC (requires root)
-sudo python3 mac_changer.py --interface eth0 --random
+# Dry-run: print the ioctl/netlink sequence without changing anything
+python3 mac_changer.py --interface lab-eth0 --set 00:11:22:33:44:55
 
-# Set specific MAC (requires root)
-sudo python3 mac_changer.py --interface eth0 --set AA:BB:CC:DD:EE:FF
+# Actually change to a random MAC (--live, root required)
+sudo python3 mac_changer.py --interface lab-eth0 --live --random
 
-# Change and persist
-sudo python3 mac_changer.py --interface eth0 --random --persist
-
-# Analyze any MAC address
-python3 mac_changer.py --analyze AA:BB:CC:DD:EE:FF
+# Set a specific lab MAC (--live, root required)
+sudo python3 mac_changer.py --interface lab-eth0 --live --set 00:11:22:33:44:55
 ```
 
-## Example Output
+The default (no args / `--harness`) runs a fully unprivileged offline harness
+that validates MAC formats, generates+re-checks a random locally-administered
+MAC, does OUI lookup, and prints the exact ioctl(2)/netlink command sequence a
+live change would issue. Interface changes are gated behind `--live`.
 
-```
-╔═══════════════════════════════════════╗
-║     N8 — MAC Changer + Analyzer       ║
-╚═══════════════════════════════════════╝
+## Live Lab Test Plan
 
-[+] Network interfaces:
-  eth0            MAC: AA:BB:CC:DD:EE:FF (Intel)
-  wlan0           MAC: 12:34:56:78:9A:BC (Unknown)
+> Authorized own-lab use only. Use documented placeholders (00:11:22:33:44:55).
 
-  MAC Analysis: AA:BB:CC:DD:EE:FF
-  ========================================
-  Vendor:             Intel
-  Type:               Locally Administered
-  Unicast/Multicast:  Unicast
-  Locally Administered: Yes
-```
+1. **Prepare a spare virtual NIC** (e.g. a VM with a dedicated `lab-eth0`).
+2. Record the original MAC: `python3 mac_changer.py --interface lab-eth0 --current`.
+3. Dry-run first: `python3 mac_changer.py --interface lab-eth0 --set 00:11:22:33:44:55`
+   — confirm it only prints the ioctl/netlink sequence and changes nothing.
+4. Apply: `sudo python3 mac_changer.py --interface lab-eth0 --live --set 00:11:22:33:44:55`.
+5. Verify: `--current` shows `00:11:22:33:44:55`; `ip link show lab-eth0` matches;
+   the VM still reaches the lab network after a link bounce.
+6. Restore the original MAC and verify connectivity is normal.
 
-## Legal Disclaimer
+## Metrics
+
+Deterministic, unprivileged, offline:
+
+- `python3 -m unittest discover -s tests` — unit tests (exit 0)
+- MAC format validation: valid/normalized/rejected cases
+- Random MAC generation re-validates as locally-administered unicast
+- OUI lookup resolves lab/default vendors
+- ioctl/netlink command sequence printed for documented change path
+- Harness exit code: `0` on success, `1` on failure
+
+## License
+
+MIT
 
 **IMPORTANT: Read before use.**
 
